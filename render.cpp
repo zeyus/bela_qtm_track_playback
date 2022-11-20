@@ -15,12 +15,25 @@
 std::string gFilename = "res/gigolo.flac";
 
 // QTM configuration
+// marker for when the process of audio playback starts
 const char* gPlaybackStartMarker = "playback_start";
+// marker for when the process of audio playback ends
 const char* gPlaybackEndMarker = "playback_end";
-const char* gTickMarker = "tick";
+// marker for when the song starts
+const char* gSongStartMarker = "song_start";
+// the sample index at which the song starts
+const unsigned int gSongStartSample = 88200; // specify real value here, 0 is the very first sample in the file
+// marker for when the song ends
+const char* gSongEndMarker = "song_end";
+// the sample index for the end of the song
+const unsigned int gSongEndSample = 5292000; // specify real value here, placeholder is 44,100 * 120 (2 minutes)
 
+// the marker to send at each tick interval
+const char* gTickMarker = "tick";
+// how often in milliseconds to send the tick marker
 const unsigned int gTickInterval = 1000; // in ms
 
+// the song sample rate, this should not need to be changed
 const unsigned int gBaseSampleRate = 44100;
 
 // how often to print out tick markers 1 = every tick, 0 = disable completely
@@ -64,6 +77,8 @@ std::vector<std::vector<float> > gSampleBuf[2];
 // read pointer relative current buffer (range 0-BUFFER_LEN)
 // initialise at BUFFER_LEN to pre-load second buffer (see render())
 int gReadPtr = BUFFER_LEN;
+// the global playback index
+unsigned int gPlaybackIndex = 0;
 // read pointer relative to file, increments by BUFFER_LEN (see fillBuffer())
 int gBufferReadPtr = 0;
 // keeps track of which buffer is currently active (switches between 0 and 1)
@@ -72,16 +87,41 @@ int gActiveBuffer = 0;
 int gDoneLoadingBuffer = 1;
 // if file read is complete this variable is set to true
 bool gDoneReadingFile = false;
+// just to indicate that after the next buffer read we should finish up
 bool gTerminateAfterRead = false;
+// this gets set to true to stop playback and end the program
 bool gStop = false;
 
+// convert the ms time to a number of samples
 const unsigned int gTickIntervalSamples = gTickInterval * gBaseSampleRate / 1000;
+
+// keep track of the current tick for printing
 unsigned int gTickCounter = 0;
+// keep track of tick printing
 unsigned int gTickPrint = 0;
+
+// The possible label types
+enum Event {
+    kPlaybackStart,
+    kPlaybackEnd,
+    kSongStart,
+    kSongEnd
+};
+
+// The current label type
+Event gRequestedEvent;
+
+// keep track of which labels have already been sent
+bool gPlaybackStartSent = false;
+bool gPlaybackEndSent = false;
+bool gSongStartSent = false;
+bool gSongEndSent = false;
 
 AuxiliaryTask gFillBufferTask;
 
-AuxiliaryTask gLabelMarkerTask;
+AuxiliaryTask gTickLabelMarkerTask;
+
+AuxiliaryTask gEventLabelMarkerTask;
 
 void fillBuffer(void*) {
 
@@ -121,11 +161,11 @@ void fillBuffer(void*) {
 
     gDoneLoadingBuffer = 1;
 
-    //printf("done loading buffer!\n");
-
 }
 
-void sendQTMLabel(const char* label, const bool verbose = false) {
+
+// This function sends a label to QTM to annotate the capture
+bool sendQTMLabel(const char* label, const bool verbose = false) {
 	if (verbose) printf("\nSending label %s...\n", label);
 	
     const bool result = rtProtocol->SetQTMEvent(label);
@@ -133,9 +173,13 @@ void sendQTMLabel(const char* label, const bool verbose = false) {
         const char* errorStr = rtProtocol->GetErrorString();
         printf("\nError sending event label (%s): %s\n", label, errorStr);
     }
+    // send the result back, true if successful, false if not
+    return result;
 }
 
-void labelMarker(void*) {
+// this is the bela scheduled task wrapper for QTM tick labels
+void tickLabelMarker(void*) {
+    // if we are not finishing up, send a tick marker
     if (!gStop) {
         sendQTMLabel(gTickMarker);
         if(gPrintEveryNTicks > 0) {
@@ -146,13 +190,37 @@ void labelMarker(void*) {
         		fflush(stdout);
         	}
         }
-        
-    } else {
-    	if(gPrintEveryNTicks > 0) {
-    		fflush(stdout);
-    	}
-        sendQTMLabel(gPlaybackEndMarker, true);
-        Bela_requestStop();
+    }
+}
+
+// bela scheduled task for QTM event labels
+void eventLabelMarker(void*) {
+    // if we use output buffering, flush any previous messages before sending the label
+    if(gPrintEveryNTicks > 0) {
+        fflush(stdout);
+    }
+    // send the label based on the requested event
+    switch (gRequestedEvent) {
+        // playback start (first audio frame)
+        case Event::kPlaybackStart:
+            if (sendQTMLabel(gPlaybackStartMarker)) gPlaybackStartSent = true;
+            break;
+        // playback end (last audio frame)
+        case Event::kPlaybackEnd:
+            if (sendQTMLabel(gPlaybackEndMarker)) {
+                gPlaybackEndSent = true;
+                // if we are here then the marker sent and we can stop the program
+                Bela_requestStop();
+            }
+            break;
+        // song start (first audio frame of the song)
+        case Event::kSongStart:
+            if (sendQTMLabel(gSongStartMarker)) gSongStartSent = true;
+            break;
+        // song end (last audio frame of the song)
+        case Event::kSongEnd:
+            if (sendQTMLabel(gSongEndMarker)) gSongEndSent = true;
+            break;
     }
 }
 
@@ -163,8 +231,13 @@ bool setup(BelaContext *context, void *userData)
 	if((gFillBufferTask = Bela_createAuxiliaryTask(&fillBuffer, 90, "fill-buffer")) == 0)
 		return false;
 
-    if ((gLabelMarkerTask =
-           Bela_createAuxiliaryTask(&labelMarker, 60, "mark-labels")) == 0)
+    // initialise tick label marker task
+    if ((gTickLabelMarkerTask =
+           Bela_createAuxiliaryTask(&tickLabelMarker, 60, "mark-labels")) == 0)
+        return false;
+    // initialise event label marker task
+    if ((gEventLabelMarkerTask =
+           Bela_createAuxiliaryTask(&eventLabelMarker, 50, "mark-labels")) == 0)
         return false;
 
     gNumFramesInFile = AudioFileUtilities::getNumFrames(gFilename);
@@ -206,7 +279,8 @@ bool setup(BelaContext *context, void *userData)
     }
     printf("Took control of QTM.\n"); 
 
-    sendQTMLabel(gPlaybackStartMarker, true);
+    // this will be done now in render
+    // sendQTMLabel(gPlaybackStartMarker, true);
 
 	return true;
 }
@@ -214,7 +288,15 @@ bool setup(BelaContext *context, void *userData)
 void render(BelaContext *context, void *userData)
 {
     if (gStop) {
-        Bela_scheduleAuxiliaryTask(gLabelMarkerTask);
+        if (!gPlaybackEndSent) {
+            // set the event label to be sent
+            gRequestedEvent = Event::kPlaybackEnd;
+            // schedule the label task
+            // we cannot call bela stop from here, it needs to be done
+            // in the auxillary task in case the program stops before the task completes.
+            Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        }
+        
         // we will just write silence to the audio output until the rest finishes up.
         for (unsigned int n = 0; n < context->audioFrames; n++) {
             for (unsigned int ch = 0; ch < context->audioOutChannels; ch++) {
@@ -257,17 +339,43 @@ void render(BelaContext *context, void *userData)
     		audioWrite(context, n, channel, out);
     	}
 
-    }
-    gTickCounter += context->audioFrames;
-    if (gTickCounter >= gTickIntervalSamples) {
-        Bela_scheduleAuxiliaryTask(gLabelMarkerTask);
-        gTickCounter = 0;
+        // Send event labels if appropriate
+        // are we at the start of the file?
+        if (gPlaybackIndex >= 0 && !gPlaybackStartSent) {
+            // schedule the playback start label task
+            gRequestedEvent = Event::kPlaybackStart;
+            Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        // are we at the start of the song?
+        } else if (gPlaybackIndex >= gSongStartSample && !gSongStartSent) {
+            // schedule the song start label task
+            gRequestedEvent = Event::kSongStart;
+            Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        // are we at the end of the song?
+        } else if (gPlaybackIndex >= gSongEndSample && !gSongEndSent) {
+            // schedule the song end label task
+            gRequestedEvent = Event::kSongEnd;
+            Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        }
+
+        // keep track of how many frames we've played (relative to last tick label)
+        gTickCounter++;
+        // the global sample index
+        gPlaybackIndex++;
+        // if we've played enough frames, send a label to QTM
+        if (gTickCounter >= gTickIntervalSamples) {
+            // schedule the tick label task, if the result is 0, it was successful
+            if(Bela_scheduleAuxiliaryTask(gTickLabelMarkerTask) == 0) {
+                // reset the counter
+                gTickCounter = 0;
+            }
+        }
     }
 }
 
 
 void cleanup(BelaContext *context, void *userData)
 {
+    // if QTM was connected, disconnect nicely on exit
     if (gConnected) {
         gConnected = false;
         rtProtocol->Disconnect();
