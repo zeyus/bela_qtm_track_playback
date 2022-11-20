@@ -298,7 +298,7 @@ void render(BelaContext* context, void* userData) {
       if (gEventStatus[Event::kPlaybackEnd] != EventStatus::kEventRequested) {
         // mark the event as requested
         gEventStatus[Event::kPlaybackEnd] = EventStatus::kEventRequested;
-        gEventRequested = true;
+        Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
       }
     } else {
       // we're ready to exit
