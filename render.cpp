@@ -299,11 +299,11 @@ void render(BelaContext* context, void* userData) {
         // mark the event as requested
         gEventStatus[Event::kPlaybackEnd] = EventStatus::kEventRequested;
         // schedule the label task
-        // we cannot call bela stop from here, it needs to be done
-        // in the auxillary task in case the program stops before the task
-        // completes.
         Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
       }
+    } else {
+        // the event label has been confirmed, we can now request bela to stop
+        Bela_requestStop();
     }
 
     // we will just write silence to the audio output until the rest finishes
