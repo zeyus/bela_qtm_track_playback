@@ -292,18 +292,19 @@ bool setup(BelaContext* context, void* userData) {
 void render(BelaContext* context, void* userData) {
   // have we reached the end of playback?
   if (gStop) {
-    // has the end marker been sent?
+    // failsafe end playback label check
     if (gEventStatus[Event::kPlaybackEnd] != EventStatus::kEventConfirmed) {
-      // have we requested QTM to send the label?
+      // if we haven't already requested the label, send it now
       if (gEventStatus[Event::kPlaybackEnd] != EventStatus::kEventRequested) {
         // mark the event as requested
         gEventStatus[Event::kPlaybackEnd] = EventStatus::kEventRequested;
-        // schedule the label task
-        Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        gEventRequested = true;
       }
     } else {
-        // the event label has been confirmed, we can now request bela to stop
+      // we're ready to exit
+      if (Bela_stopRequested() == 0) {
         Bela_requestStop();
+      }
     }
 
     // we will just write silence to the audio output until the rest finishes
@@ -315,6 +316,7 @@ void render(BelaContext* context, void* userData) {
     }
     return;
   }
+
   for (unsigned int n = 0; n < context->audioFrames; n++) {
     gEventRequested = false;
 
@@ -390,6 +392,23 @@ void render(BelaContext* context, void* userData) {
       if (gEventStatus[Event::kSongEnd] != EventStatus::kEventRequested) {
         // mark the event as requested
         gEventStatus[Event::kSongEnd] = EventStatus::kEventRequested;
+        gEventRequested = true;
+      }
+    }
+
+    // are we at the end of the file?
+    if (gPlaybackIndex >= gNumFramesInFile) {
+      // has the label been confirmed?
+      if (gEventStatus[Event::kPlaybackEnd] == EventStatus::kEventConfirmed) {
+        // we're ready to exit
+        if (Bela_stopRequested() == 0) {
+          Bela_requestStop();
+        }
+        // otherwise, if we haven't already requested the label, send it now
+      } else if (gEventStatus[Event::kPlaybackEnd] !=
+                 EventStatus::kEventRequested) {
+        // mark the event as requested
+        gEventStatus[Event::kPlaybackEnd] = EventStatus::kEventRequested;
         gEventRequested = true;
       }
     }
