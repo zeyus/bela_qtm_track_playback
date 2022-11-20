@@ -136,11 +136,6 @@ const std::vector<const char*> gEventLabels = {
     gSongEndMarker
 };
 
-// EventStatus gPlaybackStartStatus = EventStatus::kEventPending;
-// EventStatus gPlaybackEndStatus = EventStatus::kEventPending;
-// EventStatus gSongStartStatus = EventStatus::kEventPending;
-// EventStatus gSongEndStatus = EventStatus::kEventPending;
-
 AuxiliaryTask gFillBufferTask;
 
 AuxiliaryTask gTickLabelMarkerTask;
@@ -223,9 +218,9 @@ void eventLabelMarker(void*) {
     if(gPrintEveryNTicks > 0) {
         fflush(stdout);
     }
-    // request all pending labels
+    // loop through all event label statuses
     for (int i = 0; i < gEventStatus.size(); i++) {
-        // if the event is pending, request QTM to send the label
+        // if an event label has been requested, send it
         if (gEventStatus[i] == EventStatus::kEventRequested) {
             // send the label to QTM
             if(sendQTMLabel(gEventLabels[i])) {
@@ -266,9 +261,11 @@ bool setup(BelaContext *context, void *userData)
         return false;
     }
 
+    // load the file up to the specified buffer length
 	gSampleBuf[0] = AudioFileUtilities::load(gFilename, BUFFER_LEN, 0);
 	gSampleBuf[1] = gSampleBuf[0]; // initialise the inactive buffer with the same channels and frames as the first one
 
+    // initialise the QTM realtime protocol
     rtProtocol = new CRTProtocol();
     // Connect to the QTM application
     if (!rtProtocol->Connect(serverAddr, basePort, &nPort, majorVersion, minorVersion,
@@ -294,9 +291,6 @@ bool setup(BelaContext *context, void *userData)
         return false;
     }
     printf("Took control of QTM.\n"); 
-
-    // this will be done now in render
-    // sendQTMLabel(gPlaybackStartMarker, true);
 
 	return true;
 }
@@ -333,6 +327,7 @@ void render(BelaContext *context, void *userData)
 
         // Increment read pointer and reset to 0 when end of file is reached
         if(++gReadPtr >= BUFFER_LEN) {
+            // if the file hasn't finished reading, request the next buffer to be filled
             if (!gDoneReadingFile) {
                 if(!gDoneLoadingBuffer)
                     rt_printf("\nCouldn't load buffer in time :( -- try increasing buffer size!\n");
@@ -340,15 +335,18 @@ void render(BelaContext *context, void *userData)
                 gReadPtr = 0;
                 gActiveBuffer = !gActiveBuffer;
                 
+                // request the inactive buffer to be filled
                 Bela_scheduleAuxiliaryTask(gFillBufferTask);
                 
             } else {
+                // if we're done reading, and we're at the final buffer, request program stop
                 if(gTerminateAfterRead) {
                 	if (!gStop) {
                     	rt_printf("\nDone reading file, exiting after buffer playback...\n");
                     	gStop = true;
                 	}
                 } else {
+                    // otherwise we have to read the final buffer
                     gReadPtr = 0;
                     gActiveBuffer = !gActiveBuffer;
                     gTerminateAfterRead = true;
@@ -357,9 +355,10 @@ void render(BelaContext *context, void *userData)
             
         }
 
+        // write the buffer to the audio output
     	for(unsigned int channel = 0; channel < NUM_CHANNELS; channel++) {
-		float out = gSampleBuf[gActiveBuffer][channel][gReadPtr];
-    		audioWrite(context, n, channel, out);
+            float out = gSampleBuf[gActiveBuffer][channel][gReadPtr];
+            audioWrite(context, n, channel, out);
     	}
 
         // Send event labels if appropriate
@@ -384,6 +383,7 @@ void render(BelaContext *context, void *userData)
         }
 
         // are we at the end of the song?
+        // the order is of comparison is switched for fast failing (more likely to be false for longer)
         if (gPlaybackIndex >= gSongEndSample && gEventStatus[Event::kSongEnd] != EventStatus::kEventConfirmed) {
             // if we haven't already requested the label, send it now
             if (gEventStatus[Event::kSongEnd] != EventStatus::kEventRequested) {
