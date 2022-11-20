@@ -102,20 +102,44 @@ unsigned int gTickPrint = 0;
 
 // The possible label types
 enum Event {
-    kPlaybackStart,
+    kPlaybackStart = 0,
     kPlaybackEnd,
     kSongStart,
     kSongEnd
 };
 
 // The current label type
-Event gRequestedEvent;
+// Event gRequestedEvent;
+
+enum EventStatus {
+    kEventPending = 0,
+    kEventRequested,
+    kEventConfirmed,
+    kEventFailed
+};
+
+bool gEventRequested = false;
 
 // keep track of which labels have already been sent
-bool gPlaybackStartSent = false;
-bool gPlaybackEndSent = false;
-bool gSongStartSent = false;
-bool gSongEndSent = false;
+std::vector<EventStatus> gEventStatus = {
+    EventStatus::kEventPending, // kPlaybackStart
+    EventStatus::kEventPending, // kPlaybackEnd
+    EventStatus::kEventPending, // kSongStart
+    EventStatus::kEventPending // kSongEnd
+};
+
+// the event labels, in a vector
+const std::vector<const char*> gEventLabels = {
+    gPlaybackStartMarker,
+    gPlaybackEndMarker,
+    gSongStartMarker,
+    gSongEndMarker
+};
+
+// EventStatus gPlaybackStartStatus = EventStatus::kEventPending;
+// EventStatus gPlaybackEndStatus = EventStatus::kEventPending;
+// EventStatus gSongStartStatus = EventStatus::kEventPending;
+// EventStatus gSongEndStatus = EventStatus::kEventPending;
 
 AuxiliaryTask gFillBufferTask;
 
@@ -199,29 +223,21 @@ void eventLabelMarker(void*) {
     if(gPrintEveryNTicks > 0) {
         fflush(stdout);
     }
-    // send the label based on the requested event
-    switch (gRequestedEvent) {
-        // playback start (first audio frame)
-        case Event::kPlaybackStart:
-            if (sendQTMLabel(gPlaybackStartMarker)) gPlaybackStartSent = true;
-            break;
-        // playback end (last audio frame)
-        case Event::kPlaybackEnd:
-            if (sendQTMLabel(gPlaybackEndMarker)) {
-                gPlaybackEndSent = true;
-                // if we are here then the marker sent and we can stop the program
-                Bela_requestStop();
+    // request all pending labels
+    for (int i = 0; i < gEventStatus.size(); i++) {
+        // if the event is pending, request QTM to send the label
+        if (gEventStatus[i] == EventStatus::kEventRequested) {
+            // send the label to QTM
+            if(sendQTMLabel(gEventLabels[i])) {
+                // if successful, set the status to confirmed
+                gEventStatus[i] = EventStatus::kEventConfirmed;
+            } else {
+                // if not successful, set the status to failed
+                gEventStatus[i] = EventStatus::kEventFailed;
             }
-            break;
-        // song start (first audio frame of the song)
-        case Event::kSongStart:
-            if (sendQTMLabel(gSongStartMarker)) gSongStartSent = true;
-            break;
-        // song end (last audio frame of the song)
-        case Event::kSongEnd:
-            if (sendQTMLabel(gSongEndMarker)) gSongEndSent = true;
-            break;
+        }
     }
+
 }
 
 bool setup(BelaContext *context, void *userData)
@@ -287,14 +303,20 @@ bool setup(BelaContext *context, void *userData)
 
 void render(BelaContext *context, void *userData)
 {
+    // have we reached the end of playback?
     if (gStop) {
-        if (!gPlaybackEndSent) {
-            // set the event label to be sent
-            gRequestedEvent = Event::kPlaybackEnd;
-            // schedule the label task
-            // we cannot call bela stop from here, it needs to be done
-            // in the auxillary task in case the program stops before the task completes.
-            Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        // has the end marker been sent?
+        if (gEventStatus[Event::kPlaybackEnd] != EventStatus::kEventConfirmed) {
+            // have we requested QTM to send the label?
+            if (gEventStatus[Event::kPlaybackEnd] != EventStatus::kEventRequested) {
+                // mark the event as requested
+                gEventStatus[Event::kPlaybackEnd] = EventStatus::kEventRequested;
+                // schedule the label task
+                // we cannot call bela stop from here, it needs to be done
+                // in the auxillary task in case the program stops before the task completes.
+                Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+            }
+            
         }
         
         // we will just write silence to the audio output until the rest finishes up.
@@ -307,6 +329,7 @@ void render(BelaContext *context, void *userData)
 
     }
     for(unsigned int n = 0; n < context->audioFrames; n++) {
+        gEventRequested = false;
 
         // Increment read pointer and reset to 0 when end of file is reached
         if(++gReadPtr >= BUFFER_LEN) {
@@ -341,19 +364,37 @@ void render(BelaContext *context, void *userData)
 
         // Send event labels if appropriate
         // are we at the start of the file?
-        if (gPlaybackIndex >= 0 && !gPlaybackStartSent) {
-            // schedule the playback start label task
-            gRequestedEvent = Event::kPlaybackStart;
-            Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        if (gEventStatus[Event::kPlaybackStart] != EventStatus::kEventConfirmed && gPlaybackIndex >= 0) {
+            // if we haven't already requested the label, send it now
+            if (gEventStatus[Event::kPlaybackStart] != EventStatus::kEventRequested) {
+                // mark the event as requested
+                gEventStatus[Event::kPlaybackStart] = EventStatus::kEventRequested;
+                gEventRequested = true;
+            }
+        }
+
         // are we at the start of the song?
-        } else if (gPlaybackIndex >= gSongStartSample && !gSongStartSent) {
-            // schedule the song start label task
-            gRequestedEvent = Event::kSongStart;
-            Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
+        if (gEventStatus[Event::kSongStart] != EventStatus::kEventConfirmed && gPlaybackIndex >= gSongStartSample) {
+            // if we haven't already requested the label, send it now
+            if (gEventStatus[Event::kSongStart] != EventStatus::kEventRequested) {
+                // mark the event as requested
+                gEventStatus[Event::kSongStart] = EventStatus::kEventRequested;
+                gEventRequested = true;
+            }
+        }
+
         // are we at the end of the song?
-        } else if (gPlaybackIndex >= gSongEndSample && !gSongEndSent) {
-            // schedule the song end label task
-            gRequestedEvent = Event::kSongEnd;
+        if (gPlaybackIndex >= gSongEndSample && gEventStatus[Event::kSongEnd] != EventStatus::kEventConfirmed) {
+            // if we haven't already requested the label, send it now
+            if (gEventStatus[Event::kSongEnd] != EventStatus::kEventRequested) {
+                // mark the event as requested
+                gEventStatus[Event::kSongEnd] = EventStatus::kEventRequested;
+                gEventRequested = true;
+            }
+        }
+
+        if (gEventRequested) {
+            // if we have requested an event, schedule the task to send the event label to QTM
             Bela_scheduleAuxiliaryTask(gEventLabelMarkerTask);
         }
 
